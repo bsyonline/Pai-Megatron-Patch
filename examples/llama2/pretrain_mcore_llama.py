@@ -167,6 +167,7 @@ def core_gpt_dataset_config_from_args(args):
         is_built_on_rank=is_dataset_built_on_rank,
         random_seed=args.seed,
         sequence_length=args.seq_length,
+        blend_per_split=[args.train_data_path, args.valid_data_path, args.test_data_path],
         blend=args.data_path,
         split=args.split,
         path_to_cache=args.data_cache_path,

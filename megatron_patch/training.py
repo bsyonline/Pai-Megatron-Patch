@@ -36,6 +36,8 @@ from megatron.utils import (calc_params_l2_norm,
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.enums import ModelType
 from megatron.core.utils import get_model_config
+from megatron_patch.utils import ThroughputCalculator
+
 try:
     from megatron.core import DistributedDataParallel as DDP
 except:
@@ -381,7 +383,7 @@ def train_step(forward_step_func, data_iterator,
 
 def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
-                 grad_norm, params_norm, num_zeros_in_grad):
+                 grad_norm, params_norm, num_zeros_in_grad, throughput_calculator):
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -510,6 +512,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
+        tflops_rate = throughput_calculator.get_tflops_rate(elapsed_time_per_iteration)
+        throughput = num_floating_point_operations(args, batch_size) / (
+                elapsed_time_per_iteration * 10 ** 12 * args.world_size)
+        process_token_rate = throughput_calculator.get_tokens_rate(elapsed_time_per_iteration, args.world_size)
         if writer:
             if args.log_timers_to_tensorboard:
                 writer.add_scalar('iteration-time',
@@ -520,6 +526,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             args.consumed_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0)
+        log_string += ' TFLops rate: {:.2f} |'.format(tflops_rate)
+        log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+        log_string += ' Tokens rate: {} tokens/sec/GPU |'.format(round(process_token_rate))
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
         for key in total_loss_dict:
@@ -553,6 +562,42 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
 
     return report_memory_flag
 
+def num_floating_point_operations(args, batch_size):
+    # Attention projection size.
+    query_projection_size = args.kv_channels * args.num_attention_heads
+    query_projection_to_hidden_size_ratio = query_projection_size / args.hidden_size
+    # Group Query Attention.
+    if not args.group_query_attention:
+        args.num_query_groups = args.num_attention_heads
+    # MoE.
+    num_experts_routed_to = 1 if args.num_experts is None else args.moe_router_topk
+    gated_linear_multiplier = 3 / 2 if args.swiglu else 1
+    return (
+        12
+        * batch_size
+        * args.seq_length
+        * args.num_layers
+        * args.hidden_size
+        * args.hidden_size
+        * (
+            # Attention.
+            (
+                (
+                    1
+                    + (args.num_query_groups / args.num_attention_heads)
+                    + (args.seq_length / args.hidden_size)
+                ) * query_projection_to_hidden_size_ratio
+            )
+            # MLP.
+            + (
+                (args.ffn_hidden_size / args.hidden_size)
+                * num_experts_routed_to
+                * gated_linear_multiplier
+            )
+            # Logit.
+            + (args.padded_vocab_size / (2 * args.num_layers * args.hidden_size))
+        )
+    )
 
 def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler):
     timers = get_timers()
@@ -627,13 +672,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # Logging.
         loss_scale = optimizer.get_loss_scale().item()
         params_norm = None
+        throughput_calculator = ThroughputCalculator(args)
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
-                                          grad_norm, params_norm, num_zeros_in_grad)
+                                          grad_norm, params_norm, num_zeros_in_grad, throughput_calculator)
 
         # Autoresume
         if args.adlr_autoresume and \
